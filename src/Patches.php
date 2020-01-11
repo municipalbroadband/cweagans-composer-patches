@@ -101,20 +101,17 @@ class Patches implements PluginInterface, EventSubscriberInterface {
       $extra = $this->composer->getPackage()->getExtra();
       $patches_ignore = isset($extra['patches-ignore']) ? $extra['patches-ignore'] : array();
 
-      $tmp_patches = $this->grabPatches();
+      $tmp_patches = $this->grabPatches($this->composer->getPackage());
       foreach ($packages as $package) {
-        $extra = $package->getExtra();
-        if (isset($extra['patches'])) {
+        $patches = $this->grabPatches($package);
           if (isset($patches_ignore[$package->getName()])) {
-            foreach ($patches_ignore[$package->getName()] as $package_name => $patches) {
-              if (isset($extra['patches'][$package_name])) {
-                $extra['patches'][$package_name] = array_diff($extra['patches'][$package_name], $patches);
-              }
+          foreach ($patches_ignore[$package->getName()] as $package_name => $patch_set_ignore) {
+            if (isset($patches[$package_name])) {
+              $patches[$package_name] = array_diff($patches[$package_name], $patch_set_ignore);
             }
           }
-          $this->installedPatches[$package->getName()] = $extra['patches'];
         }
-        $patches = isset($extra['patches']) ? $extra['patches'] : array();
+        $this->installedPatches[$package->getName()] = $patches;
         $tmp_patches = $this->arrayMergeRecursiveDistinct($tmp_patches, $patches);
       }
 
@@ -164,7 +161,7 @@ class Patches implements PluginInterface, EventSubscriberInterface {
       return;
     }
 
-    $this->patches = $this->grabPatches();
+    $this->patches = $this->grabPatches($this->composer->getPackage());
     if (empty($this->patches)) {
       $this->io->write('<info>No patches supplied.</info>');
     }
@@ -178,17 +175,15 @@ class Patches implements PluginInterface, EventSubscriberInterface {
     foreach ($operations as $operation) {
       if ($operation->getJobType() == 'install' || $operation->getJobType() == 'update') {
         $package = $this->getPackageFromOperation($operation);
-        $extra = $package->getExtra();
-        if (isset($extra['patches'])) {
+        $patches = $this->grabPatches($package);
           if (isset($patches_ignore[$package->getName()])) {
-            foreach ($patches_ignore[$package->getName()] as $package_name => $patches) {
-              if (isset($extra['patches'][$package_name])) {
-                $extra['patches'][$package_name] = array_diff($extra['patches'][$package_name], $patches);
-              }
+          foreach ($patches_ignore[$package->getName()] as $package_name => $patch_set_ignore) {
+            if (isset($patches[$package_name])) {
+              $patches[$package_name] = array_diff($patches[$package_name], $patch_set_ignore);
             }
           }
-          $this->patches = $this->arrayMergeRecursiveDistinct($this->patches, $extra['patches']);
         }
+        $this->patches = $this->arrayMergeRecursiveDistinct($this->patches, $patches);
         // Unset installed patches for this package
         if(isset($this->installedPatches[$package->getName()])) {
           unset($this->installedPatches[$package->getName()]);
@@ -214,24 +209,37 @@ class Patches implements PluginInterface, EventSubscriberInterface {
     $this->patches['_patchesGathered'] = TRUE;
   }
 
+  private function resolvePatchUrl(PackageInterface $package, $url) {
+    if ($package === $this->composer->getPackage() || @parse_url($url, PHP_URL_SCHEME) || strpos($url, '/') === 0) {
+      return $url;
+    }
+
+    $package_path = $this->composer->getInstallationManager()->getInstallPath($package);
+    if (strpos($package_path, getcwd() . '/') === 0) {
+      $package_path = substr($package_path, strlen(getcwd() . '/'));
+    }
+    return $package_path . '/' . $url;
+  }
+
   /**
    * Get the patches from root composer or external file
    * @return Patches
    * @throws \Exception
    */
-  public function grabPatches() {
+  public function grabPatches(PackageInterface $package) {
       // First, try to get the patches from the root composer.json.
-    $extra = $this->composer->getPackage()->getExtra();
+    $extra = $package->getExtra();
+    $patches = array();
+
     if (isset($extra['patches'])) {
       $this->io->write('<info>Gathering patches for root package.</info>');
       $patches = $extra['patches'];
-      return $patches;
     }
-    // If it's not specified there, look for a patches-file definition.
-    elseif (isset($extra['patches-file'])) {
+
+    if (isset($extra['patches-file'])) {
       $this->io->write('<info>Gathering patches from patch file.</info>');
-      $patches = file_get_contents($extra['patches-file']);
-      $patches = json_decode($patches, TRUE);
+      $file_data = file_get_contents($this->resolvePatchUrl($package, $extra['patches-file']));
+      $file_json = json_decode($file_data, TRUE);
       $error = json_last_error();
       if ($error != 0) {
         switch ($error) {
@@ -256,17 +264,18 @@ class Patches implements PluginInterface, EventSubscriberInterface {
           }
           throw new \Exception('There was an error in the supplied patches file:' . $msg);
         }
-      if (isset($patches['patches'])) {
-        $patches = $patches['patches'];
-        return $patches;
+      if (isset($file_json['patches'])) {
+        $patches = $this->arrayMergeRecursiveDistinct($patches, $file_json['patches']);
       }
-      elseif(!$patches) {
-        throw new \Exception('There was an error in the supplied patch file');
       }
+
+    foreach ($patches as $package_name => $patch_set) {
+      foreach ($patch_set as $title => $url) {
+        $patches[$package_name][$title] = $this->resolvePatchUrl($package, $url);
     }
-    else {
-      return array();
     }
+
+    return $patches;
   }
 
   /**
